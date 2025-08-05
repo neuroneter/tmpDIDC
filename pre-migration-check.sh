@@ -3,7 +3,7 @@
 
 DEV_SERVER="172.16.4.4"
 STAGE_SERVER="172.16.5.4"
-DEV_PATH="/var/www/html/webcirion"
+DEV_PATH="/var/www/html/debweb"
 STAGE_PATH="/var/www/html/webcirion"
 PASSWORD="Cirion#617"
 

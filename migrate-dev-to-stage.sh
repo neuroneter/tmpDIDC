@@ -4,7 +4,7 @@
 # Variables de configuración
 DEV_SERVER="172.16.4.4"
 STAGE_SERVER="172.16.5.4"
-DEV_PATH="/var/www/html/webcirion"
+DEV_PATH="/var/www/html/debweb"
 STAGE_PATH="/var/www/html/webcirion"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_DIR="/var/log/wp-migrations"
