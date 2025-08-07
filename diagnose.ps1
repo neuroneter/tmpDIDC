@@ -1,10 +1,35 @@
 param([string]$Command)
 
-$PlinkPath = "plink"  # o la ruta completa si la conoces
-$Username = "admwb"
-$Password = "Cirion#617"
+# MISMA CONFIGURACIÓN QUE WordPressDeploymentManager.ps1
 $DevServer = "172.16.4.4"
 $StageServer = "172.16.5.4"
+$Username = "admwb"
+$Password = "Cirion#617"
+$DevPath = "/var/www/html/debweb"
+$StagePath = "/var/www/html/webcirion"
+
+# Buscar plink con la misma lógica que el manager
+$PlinkPath = $null
+$PlinkLocations = @(
+    "plink",
+    "C:\Program Files\PuTTY\plink.exe",
+    "C:\Program Files (x86)\PuTTY\plink.exe"
+)
+
+foreach ($loc in $PlinkLocations) {
+    if ($loc -eq "plink") {
+        $result = Get-Command plink -ErrorAction SilentlyContinue
+        if ($result) {
+            $PlinkPath = "plink"
+            break
+        }
+    } else {
+        if (Test-Path $loc) {
+            $PlinkPath = $loc
+            break
+        }
+    }
+}
 
 function Invoke-PlinkCommand {
     param([string]$Server, [string]$Command)
@@ -24,7 +49,8 @@ function Invoke-PlinkCommand {
     }
 }
 
-Write-Host "Ejecutando: $Command"
+Write-Host "Ejecutando: $Command" -ForegroundColor Yellow
+Write-Host "plink: $PlinkPath" -ForegroundColor Green
 Write-Host ""
 
 Invoke-PlinkCommand -Server $DevServer -Command $Command

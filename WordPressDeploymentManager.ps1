@@ -1,6 +1,7 @@
+
 param(
     [Parameter(Mandatory=$true)]
-    [ValidateSet("pre-check", "migrate", "content", "rollback")]
+    [ValidateSet("pre-check", "migrate", "rollback-complete", "status")]
     [string]$Operation,
     
     [Parameter(Mandatory=$false)]
@@ -8,485 +9,344 @@ param(
 )
 
 # Configuracion
-$ScriptPath = "C:\Scripts\WordPress"
-$LogPath = "C:\Logs\WordPress" 
 $DevServer = "172.16.4.4"
 $StageServer = "172.16.5.4"
 $Username = "admwb"
 $Password = "Cirion#617"
 $DevPath = "/var/www/html/debweb"
 $StagePath = "/var/www/html/webcirion"
+$ScriptPath = "C:\Scripts\WordPress"
 
-# Buscar plink.exe
+# Buscar plink
 $PlinkPath = $null
 $PlinkLocations = @(
     "plink",
     "C:\Program Files\PuTTY\plink.exe",
-    "C:\Program Files (x86)\PuTTY\plink.exe",
-    "$env:USERPROFILE\AppData\Local\Programs\PuTTY\plink.exe"
+    "C:\Program Files (x86)\PuTTY\plink.exe"
 )
 
 foreach ($loc in $PlinkLocations) {
-    try {
-        if ($loc -eq "plink") {
-            $result = Get-Command plink -ErrorAction SilentlyContinue
-            if ($result) {
-                $PlinkPath = "plink"
-                break
-            }
-        } else {
-            if (Test-Path $loc) {
-                $PlinkPath = $loc
-                break
-            }
+    if ($loc -eq "plink") {
+        $result = Get-Command plink -ErrorAction SilentlyContinue
+        if ($result) {
+            $PlinkPath = "plink"
+            break
         }
-    } catch { }
-}
-
-function Write-Log {
-    param([string]$Message, [string]$Type = "INFO")
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logMessage = "[$timestamp] [$Type] $Message"
-    
-    $color = switch($Type) {
-        "ERROR" { "Red" }
-        "SUCCESS" { "Green" }
-        "WARNING" { "Yellow" }
-        default { "White" }
-    }
-    
-    Write-Host $logMessage -ForegroundColor $color
-    
-    # Guardar en archivo de log
-    if (-not (Test-Path $LogPath)) {
-        New-Item -ItemType Directory -Force -Path $LogPath | Out-Null
-    }
-    $logFile = "$LogPath\wordpress_operations_$(Get-Date -Format 'yyyyMMdd').log"
-    Add-Content -Path $logFile -Value $logMessage
-    
-    # Para Azure DevOps
-    switch($Type) {
-        "ERROR" { Write-Host "##vso[task.logissue type=error]$Message" }
-        "WARNING" { Write-Host "##vso[task.logissue type=warning]$Message" }
-        "SUCCESS" { Write-Host "##vso[task.complete result=Succeeded]$Message" }
+    } else {
+        if (Test-Path $loc) {
+            $PlinkPath = $loc
+            break
+        }
     }
 }
 
-function Invoke-PlinkCommand {
-    param(
-        [string]$Server,
-        [string]$Command,
-        [int]$TimeoutSeconds = 30
-    )
+function Write-ColorLog {
+    param([string]$Message, [string]$Color = "White")
+    Write-Host $Message -ForegroundColor $Color
+}
+
+function Invoke-SSHCommand {
+    param([string]$Server, [string]$Command)
     
     if (-not $PlinkPath) {
-        Write-Log "ERROR: plink.exe no encontrado. Instalar PuTTY" "ERROR"
-        return @{ Success = $false; Output = "plink not found"; ExitCode = -1 }
+        Write-ColorLog "ERROR: plink no encontrado" "Red"
+        return $null
     }
     
-    Write-Log "Ejecutando en ${Server}: $Command"
+    $plinkArgs = @("-ssh", "-pw", $Password, "-batch", "$Username@$Server", $Command)
+    $result = & $PlinkPath $plinkArgs 2>&1
     
-    try {
-        # Comando plink con contraseña
-        $plinkArgs = @(
-            "-ssh",
-            "-pw", $Password,
-            "-batch",
-            "$Username@$Server",
-            $Command
-        )
-        
-        # Ejecutar plink
-        $result = & $PlinkPath $plinkArgs 2>&1
-        $exitCode = $LASTEXITCODE
-        
-        if ($exitCode -eq 0) {
-            Write-Log "SUCCESS: Comando ejecutado exitosamente" "SUCCESS"
-            return @{ Success = $true; Output = $result; ExitCode = $exitCode }
-        } else {
-            Write-Log "WARNING: Comando completo con codigo: $exitCode" "WARNING"
-            Write-Log "Output: $result" "WARNING"
-            return @{ Success = $false; Output = $result; ExitCode = $exitCode }
-        }
-    }
-    catch {
-        Write-Log "ERROR ejecutando plink: $($_.Exception.Message)" "ERROR"
-        return @{ Success = $false; Output = $_.Exception.Message; ExitCode = -1 }
+    if ($LASTEXITCODE -eq 0) {
+        return $result
+    } else {
+        return $null
     }
 }
 
-function Test-ServerConnectivity {
-    Write-Log "Verificando conectividad con plink..."
-    Write-Log "plink encontrado en: $PlinkPath"
+function Test-Connectivity {
+    Write-ColorLog "Verificando conectividad..." "Yellow"
     
-    $servers = @(
-        @{ Name = "Dev"; IP = $DevServer },
-        @{ Name = "Stage"; IP = $StageServer }
-    )
+    # Test Dev
+    if (Test-Connection -ComputerName $DevServer -Count 1 -Quiet) {
+        Write-ColorLog "Dev server: OK" "Green"
+    } else {
+        Write-ColorLog "Dev server: FALLO" "Red"
+        return $false
+    }
     
-    foreach ($server in $servers) {
-        # Test ping
-        Write-Log "Testing ping to $($server.Name) ($($server.IP))..."
-        if (Test-Connection -ComputerName $server.IP -Count 1 -Quiet) {
-            Write-Log "SUCCESS: Ping OK to $($server.Name)" "SUCCESS"
-        } else {
-            Write-Log "ERROR: Ping failed to $($server.Name)" "ERROR"
-            return $false
-        }
-        
-        # Test plink
-        Write-Log "Testing plink SSH to $($server.Name)..."
-        $plinkResult = Invoke-PlinkCommand -Server $server.IP -Command "echo 'Connection test OK'"
-        
-        if ($plinkResult.Success) {
-            Write-Log "SUCCESS: plink SSH OK to $($server.Name): $($plinkResult.Output)" "SUCCESS"
-        } else {
-            Write-Log "ERROR: plink SSH failed to $($server.Name)" "ERROR"
-            Write-Log "Error: $($plinkResult.Output)" "ERROR"
-            return $false
-        }
+    # Test Stage  
+    if (Test-Connection -ComputerName $StageServer -Count 1 -Quiet) {
+        Write-ColorLog "Stage server: OK" "Green"
+    } else {
+        Write-ColorLog "Stage server: FALLO" "Red"
+        return $false
+    }
+    
+    # Test SSH Dev
+    $testDev = Invoke-SSHCommand -Server $DevServer -Command "echo test"
+    if ($testDev) {
+        Write-ColorLog "SSH Dev: OK" "Green"
+    } else {
+        Write-ColorLog "SSH Dev: FALLO" "Red"
+        return $false
+    }
+    
+    # Test SSH Stage
+    $testStage = Invoke-SSHCommand -Server $StageServer -Command "echo test"
+    if ($testStage) {
+        Write-ColorLog "SSH Stage: OK" "Green"
+    } else {
+        Write-ColorLog "SSH Stage: FALLO" "Red"
+        return $false
     }
     
     return $true
 }
 
-function Test-WordPressInstallation {
+function Show-Status {
+    Write-ColorLog "=== ESTADO DEL SISTEMA ===" "Cyan"
+    
+    # Espacio libre Stage
+    $spaceResult = Invoke-SSHCommand -Server $StageServer -Command "df /tmp | tail -1 | awk '{print int(`$4/1024)}'"
+    if ($spaceResult) {
+        $spaceMB = $spaceResult.Trim()
+        Write-ColorLog "Espacio libre Stage: ${spaceMB}MB" "Green"
+    }
+    
+    # Backups BD
+    $dbBackups = Invoke-SSHCommand -Server $StageServer -Command "ls /tmp/stage_safety_backup_*.sql 2>/dev/null | wc -l"
+    if ($dbBackups) {
+        Write-ColorLog "BD Backups: $($dbBackups.Trim())" "Green"
+    }
+    
+    # Backups Uploads
+    $uploadsBackups = Invoke-SSHCommand -Server $StageServer -Command "ls /tmp/stage_uploads_backup_*.tar.gz 2>/dev/null | wc -l"
+    if ($uploadsBackups) {
+        Write-ColorLog "Uploads Backups: $($uploadsBackups.Trim())" "Green"
+    }
+    
+    # Listar backups recientes
+    Write-ColorLog "Backups recientes:" "Cyan"
+    $recentBackups = Invoke-SSHCommand -Server $StageServer -Command "ls -lt /tmp/stage_*backup_*.* 2>/dev/null | head -5"
+    if ($recentBackups) {
+        $recentBackups -split "`n" | ForEach-Object {
+            if ($_.Trim()) {
+                Write-ColorLog "  $_" "White"
+            }
+        }
+    }
+}
+
+function Test-WordPress {
     param([string]$Server, [string]$Path, [string]$EnvName)
     
-    Write-Log "Verificando WordPress en $EnvName..."
+    Write-ColorLog "Verificando WordPress $EnvName..." "Yellow"
     
-    # Usar wp-cli.phar que acabamos de instalar PRIMERO
-    $wpCommands = @(
-        "/home/$Username/bin/wp",                # ← AGREGAR ESTA LÍNEA
-        "php /home/$Username/wp-cli.phar",
-        "/home/$Username/wp-cli.phar", 
-        "wp",
-        "/usr/local/bin/wp"
-    )
-    
-    $workingWpCommand = $null
-    
-    foreach ($wpCmd in $wpCommands) {
-        Write-Log "Probando WP-CLI: $wpCmd"
-        $testResult = Invoke-PlinkCommand -Server $Server -Command "cd $Path && $wpCmd --version" -TimeoutSeconds 10
-        
-        if ($testResult.Success -and $testResult.Output -like "*WP-CLI*") {
-            $workingWpCommand = $wpCmd
-            Write-Log "SUCCESS: WP-CLI funcionando en $EnvName con: $wpCmd" "SUCCESS"
-            Write-Log "Version: $($testResult.Output.Trim())" "SUCCESS"
-            break
-        } else {
-            Write-Log "FAILED: $wpCmd no funciona - $($testResult.Output)" "WARNING"
-        }
-    }
-    
-    if (-not $workingWpCommand) {
-        Write-Log "ERROR: WP-CLI no encontrado o no funciona en $EnvName" "ERROR"
-        return $false
-    }
-    
-    # Verificar que WordPress está instalado usando el comando que funciona
-    $wpCheckResult = Invoke-PlinkCommand -Server $Server -Command "cd $Path && $workingWpCommand core is-installed"
-    
-    if ($wpCheckResult.Success) {
-        # Obtener versión de WordPress usando el comando que funciona
-        $wpVersionResult = Invoke-PlinkCommand -Server $Server -Command "cd $Path && $workingWpCommand core version"
-        if ($wpVersionResult.Success) {
-            Write-Log "SUCCESS: WordPress $($wpVersionResult.Output.Trim()) funcionando en $EnvName" "SUCCESS"
-        } else {
-            Write-Log "SUCCESS: WordPress instalado en $EnvName" "SUCCESS"
-        }
-        
-        # Verificar base de datos usando el comando que funciona
-        $dbCheckResult = Invoke-PlinkCommand -Server $Server -Command "cd $Path && $workingWpCommand db check"
-        if ($dbCheckResult.Success) {
-            Write-Log "SUCCESS: Base de datos $EnvName OK" "SUCCESS"
-        } else {
-            Write-Log "WARNING: Base de datos $EnvName con advertencias" "WARNING"
-        }
-        
+    $wpTest = Invoke-SSHCommand -Server $Server -Command "cd $Path && wp core is-installed"
+    if ($wpTest -ne $null) {
+        Write-ColorLog "$EnvName WordPress: OK" "Green"
         return $true
     } else {
-        Write-Log "ERROR: WordPress no funciona en $EnvName" "ERROR"
-        Write-Log "Error: $($wpCheckResult.Output)" "ERROR"
+        Write-ColorLog "$EnvName WordPress: FALLO" "Red"
         return $false
     }
 }
 
-function Test-DiskSpace {
-    Write-Log "Verificando espacio en disco..."
+function Execute-PreCheck {
+    Write-ColorLog "=== PRE-CHECK COMPLETO ===" "Cyan"
     
-    # Verificar espacio en Dev
-    $devSpaceResult = Invoke-PlinkCommand -Server $DevServer -Command "df /tmp | tail -1 | awk '{print `$4}'"
-    if (-not $devSpaceResult.Success) {
-        Write-Log "ERROR: No se pudo verificar espacio en Dev" "ERROR"
+    if (-not (Test-WordPress -Server $DevServer -Path $DevPath -EnvName "Development")) {
         return $false
     }
     
-    # Verificar espacio en Stage
-    $stageSpaceResult = Invoke-PlinkCommand -Server $StageServer -Command "df /tmp | tail -1 | awk '{print `$4}'"
-    if (-not $stageSpaceResult.Success) {
-        Write-Log "ERROR: No se pudo verificar espacio en Stage" "ERROR"
+    if (-not (Test-WordPress -Server $StageServer -Path $StagePath -EnvName "Stage")) {
         return $false
     }
     
-    try {
-        $devSpace = [int]($devSpaceResult.Output.Trim())
-        $stageSpace = [int]($stageSpaceResult.Output.Trim())
-        
-        Write-Log "Espacio disponible - Dev: ${devSpace}KB, Stage: ${stageSpace}KB"
-        
-        if ($devSpace -lt 1000000 -or $stageSpace -lt 1000000) {
-            Write-Log "ERROR: Espacio insuficiente en disco (mínimo 1GB)" "ERROR"
-            Write-Log "Dev: ${devSpace}KB, Stage: ${stageSpace}KB" "ERROR"
-            return $false
-        } else {
-            Write-Log "SUCCESS: Espacio en disco suficiente" "SUCCESS"
-            return $true
-        }
-    }
-    catch {
-        Write-Log "ERROR: Error procesando espacio en disco: $($_.Exception.Message)" "ERROR"
-        return $false
-    }
-}
-
-function Execute-PreMigrationCheck {
-    Write-Log "=== EJECUTANDO VERIFICACIONES COMPLETAS ===" "SUCCESS"
-    
-    # 1. Verificar WordPress en Development
-    if (-not (Test-WordPressInstallation -Server $DevServer -Path $DevPath -EnvName "Development")) {
-        return $false
-    }
-    
-    # 2. Verificar WordPress en Stage
-    if (-not (Test-WordPressInstallation -Server $StageServer -Path $StagePath -EnvName "Stage")) {
-        return $false
-    }
-    
-    # 3. Verificar espacio en disco
-    if (-not (Test-DiskSpace)) {
-        return $false
-    }
-    
-    Write-Log "SUCCESS: Todas las verificaciones completadas exitosamente" "SUCCESS"
+    Write-ColorLog "SUCCESS: Sistema listo para migracion" "Green"
     return $true
 }
 
-function Copy-ScriptsToServer {
-    Write-Log "Copiando scripts usando pscp (PuTTY SCP)..."
+function Copy-Script {
+    Write-ColorLog "Copiando script de migracion..." "Yellow"
     
-    # Buscar pscp.exe
     $PscpPath = $PlinkPath -replace "plink", "pscp"
     if ($PlinkPath -eq "plink") {
         $PscpPath = "pscp"
     }
     
-    try {
-        # Verificar que los scripts existan
-        $scripts = @("migrate-dev-to-stage.sh")
-        
-        foreach ($script in $scripts) {
-            $localPath = "$ScriptPath\$script"
-            if (-not (Test-Path $localPath)) {
-                Write-Log "ERROR: Script no encontrado: $localPath" "ERROR"
-                return $false
-            }
-        }
-        
-        # Copiar script de migración usando pscp
-        foreach ($script in $scripts) {
-            $localPath = "$ScriptPath\$script"
-            Write-Log "Copiando $script..."
-            
-            $pscpArgs = @(
-                "-pw", $Password,
-                "-batch",
-                $localPath,
-                "$Username@${DevServer}:/tmp/"
-            )
-            
-            $pscpResult = & $PscpPath $pscpArgs 2>&1
-            $pscpExitCode = $LASTEXITCODE
-            
-            if ($pscpExitCode -eq 0) {
-                Write-Log "SUCCESS: $script copiado exitosamente" "SUCCESS"
-            } else {
-                Write-Log "ERROR copiando $script : $pscpResult" "ERROR"
-                return $false
-            }
-        }
-        
-        # Hacer script ejecutable
-        $chmodCommand = "chmod +x /tmp/migrate-dev-to-stage.sh"
-        $chmodResult = Invoke-PlinkCommand -Server $DevServer -Command $chmodCommand
-        
-        if ($chmodResult.Success) {
-            Write-Log "SUCCESS: Permisos de ejecucion configurados" "SUCCESS"
-        } else {
-            Write-Log "WARNING: Advertencia configurando permisos: $($chmodResult.Output)" "WARNING"
-        }
-        
-        Write-Log "SUCCESS: Scripts copiados exitosamente" "SUCCESS"
+    $scriptFile = "$ScriptPath\migrate-dev-to-stage.sh"
+    if (-not (Test-Path $scriptFile)) {
+        Write-ColorLog "ERROR: Script no encontrado" "Red"
+        return $false
+    }
+    
+    $pscpArgs = @("-pw", $Password, "-batch", $scriptFile, "$Username@${DevServer}:/tmp/")
+    $result = & $PscpPath $pscpArgs 2>&1
+    
+    if ($LASTEXITCODE -eq 0) {
+        # Hacer ejecutable
+        Invoke-SSHCommand -Server $DevServer -Command "chmod +x /tmp/migrate-dev-to-stage.sh" | Out-Null
+        Write-ColorLog "Script copiado exitosamente" "Green"
         return $true
-        
-    } catch {
-        Write-Log "ERROR copiando scripts: $($_.Exception.Message)" "ERROR"
+    } else {
+        Write-ColorLog "ERROR copiando script" "Red"
         return $false
     }
 }
 
 function Execute-Migration {
-    Write-Log "Ejecutando migracion Development -> Stage..."
-    Write-Log "Esta operacion puede tomar varios minutos..."
+    Write-ColorLog "=== EJECUTANDO MIGRACION ===" "Cyan"
+    Write-ColorLog "Esto puede tomar varios minutos..." "Yellow"
     
-    $migrateCommand = "cd /tmp; ./migrate-dev-to-stage.sh"
-    $result = Invoke-PlinkCommand -Server $DevServer -Command $migrateCommand -TimeoutSeconds 600
+    $migrateCommand = "cd /tmp && ./migrate-dev-to-stage.sh"
+    $result = Invoke-SSHCommand -Server $DevServer -Command $migrateCommand
     
-    if ($result.Success) {
-        Write-Log "SUCCESS: Migracion completada exitosamente" "SUCCESS"
+    if ($result) {
+        Write-ColorLog "SUCCESS: Migracion completada" "Green"
         
-        # Extraer Migration ID
-        $migrationIdMatch = $result.Output | Select-String "Migration ID: (\w+)"
-        if ($migrationIdMatch) {
-            $script:LastMigrationId = $migrationIdMatch.Matches[0].Groups[1].Value
-            Write-Log "Migration ID: $script:LastMigrationId" "SUCCESS"
+        # Buscar Migration ID
+        $lines = $result -split "`n"
+        foreach ($line in $lines) {
+            if ($line -match "Migration ID: (\w+)") {
+                $migrationId = $matches[1]
+                Write-ColorLog "Migration ID: $migrationId" "Green"
+                Write-ColorLog "Para rollback: -Operation rollback-complete -MigrationId $migrationId" "Yellow"
+                break
+            }
         }
         
-        Write-Log "Resultado de migracion:"
-        Write-Log "$($result.Output)"
+        # Verificar sitio
+        Test-Website
         return $true
     } else {
-        Write-Log "ERROR: Migracion fallo" "ERROR"
-        Write-Log "Output: $($result.Output)"
+        Write-ColorLog "ERROR: Migracion fallo" "Red"
         return $false
     }
 }
 
-function Test-StageWebsite {
-    Write-Log "Verificando sitio Stage..."
+function Execute-Rollback {
+    param([string]$MigrationId)
     
-    try {
-        $response = Invoke-WebRequest -Uri "https://web3stg.ciriontechnologies.com" -Method HEAD -TimeoutSec 30
-        
-        if ($response.StatusCode -eq 200) {
-            Write-Log "SUCCESS: Sitio Stage responde correctamente (HTTP 200)" "SUCCESS"
-            return $true
-        } else {
-            Write-Log "WARNING: Sitio Stage codigo: $($response.StatusCode)" "WARNING"
-            return $false
-        }
-    } catch {
-        Write-Log "ERROR: Sitio Stage no responde: $($_.Exception.Message)" "ERROR"
+    if (-not $MigrationId) {
+        Write-ColorLog "ERROR: Migration ID requerido" "Red"
+        Show-Status
         return $false
+    }
+    
+    Write-ColorLog "=== ROLLBACK COMPLETO ===" "Red"
+    Write-ColorLog "Migration ID: $MigrationId" "Yellow"
+    
+    # Verificar backups existen
+    $dbExists = Invoke-SSHCommand -Server $StageServer -Command "test -f /tmp/stage_safety_backup_$MigrationId.sql && echo yes || echo no"
+    if ($dbExists.Trim() -ne "yes") {
+        Write-ColorLog "ERROR: Backup BD no encontrado" "Red"
+        return $false
+    }
+    
+    # Rollback BD
+    Write-ColorLog "Restaurando base de datos..." "Yellow"
+    $dbRollback = Invoke-SSHCommand -Server $StageServer -Command "cd $StagePath && wp db import /tmp/stage_safety_backup_$MigrationId.sql"
+    if (-not $dbRollback) {
+        Write-ColorLog "ERROR: Fallo rollback BD" "Red"
+        return $false
+    }
+    
+    # Rollback Uploads (si existe)
+    $uploadsExists = Invoke-SSHCommand -Server $StageServer -Command "test -f /tmp/stage_uploads_backup_$MigrationId.tar.gz && echo yes || echo no"
+    if ($uploadsExists.Trim() -eq "yes") {
+        Write-ColorLog "Restaurando uploads..." "Yellow"
+        $uploadsRollback = Invoke-SSHCommand -Server $StageServer -Command "cd $StagePath/wp-content && rm -rf uploads && tar -xzf /tmp/stage_uploads_backup_$MigrationId.tar.gz"
+        if ($uploadsRollback -ne $null) {
+            Write-ColorLog "Uploads restaurados" "Green"
+        }
+    }
+    
+    Write-ColorLog "SUCCESS: Rollback completo exitoso" "Green"
+    Test-Website
+    return $true
+}
+
+function Test-Website {
+    Write-ColorLog "Verificando sitio web..." "Yellow"
+    
+    $uri = "https://web3stg.ciriontechnologies.com"
+    $response = Invoke-WebRequest -Uri $uri -Method HEAD -TimeoutSec 30 -ErrorAction SilentlyContinue
+    
+    if ($response -and $response.StatusCode -eq 200) {
+        Write-ColorLog "Sitio web: OK (HTTP 200)" "Green"
+    } else {
+        Write-ColorLog "Sitio web: Problema de acceso" "Red"
     }
 }
 
-# === FUNCION PRINCIPAL ===
-try {
-    Write-Log "=== WordPress Deployment Manager (FINAL) ===" "SUCCESS"
-    Write-Log "Operacion: $Operation"
-    Write-Log "Jump Server: $env:COMPUTERNAME"
-    Write-Log "Usuario: $Username"
-    Write-Log "plink Path: $PlinkPath"
-    Write-Log "Fecha/Hora: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-    Write-Log "============================================"
-    
-    # Verificar que plink existe
-    if (-not $PlinkPath) {
-        Write-Log "ERROR: plink.exe no encontrado. Instalar PuTTY." "ERROR"
-        Write-Log "Descargar desde: https://www.putty.org/" "WARNING"
-        exit 1
-    }
-    
-    # Verificar conectividad
-    if (-not (Test-ServerConnectivity)) {
-        Write-Log "ERROR: Fallo en conectividad - Abortando operacion" "ERROR"
-        exit 1
-    }
-    
-    # Ejecutar operacion
-    switch ($Operation) {
-        "pre-check" {
-            Write-Log "=== VERIFICACIONES PREVIAS COMPLETAS ===" "SUCCESS"
-            
-            if (Execute-PreMigrationCheck) {
-                Write-Log "SUCCESS: RESULTADO: Sistema listo para migracion" "SUCCESS"
-                Write-Log "Resumen:"
-                Write-Log "- WordPress Development: OK"
-                Write-Log "- WordPress Stage: OK"
-                Write-Log "- Espacio en disco: Suficiente"
-                Write-Log "- Conectividad: OK"
-                exit 0
-            } else {
-                Write-Log "ERROR: RESULTADO: Sistema NO listo" "ERROR"
-                exit 1
-            }
-        }
-        
-        "migrate" {
-            Write-Log "=== MIGRACION COMPLETA ===" "SUCCESS"
-            
-            # Verificaciones previas
-            Write-Log "Paso 1/4: Verificaciones previas..."
-            if (-not (Execute-PreMigrationCheck)) {
-                Write-Log "ERROR: Verificaciones fallaron - Abortando" "ERROR"
-                exit 1
-            }
-            
-            # Copiar scripts
-            Write-Log "Paso 2/4: Copiando scripts..."
-            if (-not (Copy-ScriptsToServer)) {
-                Write-Log "ERROR: Fallo copiando scripts - Abortando" "ERROR"
-                exit 1
-            }
-            
-            # Migracion
-            Write-Log "Paso 3/4: Ejecutando migracion..."
-            if (-not (Execute-Migration)) {
-                Write-Log "ERROR: Migracion fallo" "ERROR"
-                exit 1
-            }
-            
-            # Verificar sitio
-            Write-Log "Paso 4/4: Verificando sitio web..."
-            Test-StageWebsite
-            
-            Write-Log "SUCCESS: RESULTADO: Migracion completada exitosamente" "SUCCESS"
-            exit 0
-        }
-        
-        "content" {
-            Write-Log "=== SINCRONIZACION DE CONTENIDO ===" "SUCCESS"
-            Write-Log "WARNING: Funcion pendiente - usar 'migrate' por ahora" "WARNING"
-            exit 0
-        }
-        
-        "rollback" {
-            Write-Log "=== ROLLBACK ===" "WARNING"
-            
-            if (-not $MigrationId) {
-                Write-Log "ERROR: Migration ID requerido" "ERROR"
-                exit 1
-            }
-            
-            $rollbackCommand = "cd /var/www/html/webcirion; wp db import /tmp/stage_safety_backup_$MigrationId.sql"
-            $rollbackResult = Invoke-PlinkCommand -Server $StageServer -Command $rollbackCommand
-            
-            if ($rollbackResult.Success) {
-                Write-Log "SUCCESS: Rollback completado" "SUCCESS"
-                Test-StageWebsite
-            } else {
-                Write-Log "ERROR en rollback: $($rollbackResult.Output)" "ERROR"
-            }
-            
-            exit 0
-        }
-    }
-    
-} catch {
-    Write-Log "ERROR critico: $($_.Exception.Message)" "ERROR"
+# MAIN EXECUTION
+Write-ColorLog "============================================" "White"
+Write-ColorLog "WordPress Deployment Manager - SIMPLE" "Cyan"
+Write-ColorLog "============================================" "White"
+Write-ColorLog "Operacion: $Operation" "White"
+Write-ColorLog "plink: $PlinkPath" "White"
+Write-ColorLog "Fecha: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" "White"
+Write-ColorLog "============================================" "White"
+
+if (-not $PlinkPath) {
+    Write-ColorLog "ERROR: plink no encontrado. Instalar PuTTY" "Red"
     exit 1
 }
 
-Write-Log "Operacion completada" "SUCCESS"
+# Verificar conectividad para operaciones que la necesitan
+if ($Operation -ne "rollback-complete" -or -not $MigrationId) {
+    if (-not (Test-Connectivity)) {
+        Write-ColorLog "ERROR: Fallo conectividad" "Red"
+        exit 1
+    }
+}
+
+# Ejecutar operacion
+if ($Operation -eq "status") {
+    Show-Status
+    exit 0
+}
+
+if ($Operation -eq "pre-check") {
+    if (Execute-PreCheck) {
+        exit 0
+    } else {
+        exit 1
+    }
+}
+
+if ($Operation -eq "migrate") {
+    # Pre-check
+    if (-not (Execute-PreCheck)) {
+        Write-ColorLog "ERROR: Pre-check fallo" "Red"
+        exit 1
+    }
+    
+    # Copiar script
+    if (-not (Copy-Script)) {
+        Write-ColorLog "ERROR: Fallo copiando script" "Red"
+        exit 1
+    }
+    
+    # Migrar
+    if (Execute-Migration) {
+        Write-ColorLog "SUCCESS: Migracion exitosa" "Green"
+        exit 0
+    } else {
+        Write-ColorLog "ERROR: Migracion fallo" "Red"
+        exit 1
+    }
+}
+
+if ($Operation -eq "rollback-complete") {
+    if (Execute-Rollback -MigrationId $MigrationId) {
+        Write-ColorLog "SUCCESS: Rollback exitoso" "Green"
+        exit 0
+    } else {
+        Write-ColorLog "ERROR: Rollback fallo" "Red"
+        exit 1
+    }
+}
+
+Write-ColorLog "Operacion completada" "Green"
